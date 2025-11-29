@@ -15,7 +15,7 @@ from services.mws_client import (
 )
 from services.llm_client import ask_llm
 
-# Загружаем переменные окружения из .env
+
 load_dotenv()
 
 app = FastAPI(
