@@ -9,7 +9,7 @@ import requests
 load_dotenv()
 
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
-YOUTUBE_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID")  # канал по умолчанию (может быть пустым)
+YOUTUBE_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID")  # канал по умолчанию
 
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 
@@ -23,10 +23,10 @@ def _require_api_key():
         raise YouTubeAPIError("Не задан YOUTUBE_API_KEY в .env")
 
 
-# простой кэш, чтобы не долбить YouTube при каждом вопросе
-# ключ: (channel_id, max_results) -> (timestamp, data)
+# ---- простой кэш, чтобы не долбить YouTube лишний раз ----
+
 _CACHE: Dict[tuple, tuple] = {}
-_CACHE_TTL_SECONDS = 60  # можно увеличить/уменьшить по вкусу
+_CACHE_TTL_SECONDS = 60  # сек
 
 
 def _cache_get(channel_id: str, max_results: int) -> Optional[List[Dict]]:
@@ -45,16 +45,11 @@ def _cache_set(channel_id: str, max_results: int, data: List[Dict]) -> None:
     _CACHE[key] = (time.time(), data)
 
 
+# ---- разбор ссылок/хэндлов ----
+
 def _extract_ids_from_url(raw: str) -> Dict[str, Optional[str]]:
     """
-    Пытаемся вытащить channelId/handle/videoId из разных форматов URL YouTube.
-
-    Возвращает dict c полями:
-      {
-        "channel_id": Optional[str],
-        "handle": Optional[str],
-        "video_id": Optional[str]
-      }
+    Пытаемся вытащить channel_id / handle / video_id из разных форматов URL YouTube.
     """
     s = raw.strip()
 
@@ -85,21 +80,23 @@ def _extract_ids_from_url(raw: str) -> Dict[str, Optional[str]]:
         result["channel_id"] = channel_id
         return result
 
-    # ссылка с @handle
+    # ссылка с @handle, например /@MajorRainbow или /@MajorRainbow/videos
     if "youtube.com/@" in s:
         after = s.split("youtube.com/@")[-1]
         handle = after.split("/")[0].split("?")[0].split("&")[0]
         result["handle"] = "@" + handle
         return result
 
-    # user/ или c/ — считаем, что это имя / хэндл, дальше пойдём в search
-    # здесь ничего не заполняем, просто вернём пустой result -> пойдём в общий поиск
+    # user/ или c/ — считаем, что это имя/часть URL → дальше будем искать через search
     return result
 
 
+# ---- точные функции поиска канала ----
+
 def _find_channel_by_search(query: str) -> str:
     """
-    Ищем канал через search API по строке: handle, названию, кусочку URL и т.п.
+    Ищем канал через search API по строке: имя, кусок URL и т.п.
+    Это fallback, если по handle / video_id не нашли.
     """
     _require_api_key()
 
@@ -122,6 +119,36 @@ def _find_channel_by_search(query: str) -> str:
 
     channel_id = items[0]["snippet"]["channelId"]
     return channel_id
+
+
+def _get_channel_id_from_handle(handle: str) -> str:
+    """
+    Для @handle используем точный метод YouTube:
+    GET channels?forHandle=@handle
+    """
+    _require_api_key()
+
+    # на всякий случай приводим к виду @xxxx
+    handle = handle.strip()
+    if not handle.startswith("@"):
+        handle = "@" + handle
+
+    params = {
+        "part": "id",
+        "forHandle": handle,
+        "key": YOUTUBE_API_KEY,
+    }
+    resp = requests.get(f"{YOUTUBE_API_BASE}/channels", params=params)
+    data = resp.json()
+
+    if resp.status_code != 200:
+        raise YouTubeAPIError(f"Ошибка YouTube channels(forHandle): {data}")
+
+    items = data.get("items", [])
+    if not items:
+        raise YouTubeAPIError(f"Канал с handle '{handle}' не найден")
+
+    return items[0]["id"]
 
 
 def _get_channel_id_from_video(video_id: str) -> str:
@@ -156,19 +183,15 @@ def _resolve_channel_id(channel: Optional[str]) -> str:
     """
     Определяем channelId для любых входных данных:
 
-    - None или пустая строка -> YOUTUBE_CHANNEL_ID из .env
-    - UC... (channelId) -> используем как есть
-    - @handle -> ищем канал через search
-    - URL:
-        * youtu.be/... или watch?v=... -> находим видео, из него channelId
-        * youtube.com/channel/UC... -> берём channelId из ссылки
-        * youtube.com/@... -> ищем по handle
-        * всё остальное -> идём в search по всей строке
-    - Прочий текст -> search по строке
+      - None/пусто              -> YOUTUBE_CHANNEL_ID из .env
+      - 'UC...'                 -> используем как есть
+      - '@handle'               -> точный запрос через channels?forHandle
+      - URL (канал/видео)       -> парсим и берём либо handle, либо channelId, либо videoId
+      - обычная строка (имя)    -> search по названию
     """
     _require_api_key()
 
-    # 1. Канал не указан -> берём дефолтный из .env
+    # нет входа → дефолтный канал
     if channel is None or channel.strip() == "":
         if not YOUTUBE_CHANNEL_ID:
             raise YouTubeAPIError(
@@ -178,33 +201,36 @@ def _resolve_channel_id(channel: Optional[str]) -> str:
 
     channel = channel.strip()
 
-    # 2. Если это готовый channelId
+    # готовый channelId
     if channel.startswith("UC") and len(channel) >= 20:
         return channel
 
-    # 3. Если это @handle
+    # @handle
     if channel.startswith("@"):
-        return _find_channel_by_search(channel)
+        return _get_channel_id_from_handle(channel)
 
-    # 4. Если похоже на URL
+    # URL
     if channel.startswith("http://") or channel.startswith("https://"):
         ids = _extract_ids_from_url(channel)
-        # ссылка на видео
+
         if ids["video_id"]:
             return _get_channel_id_from_video(ids["video_id"])
-        # ссылка на канал с channelId
+
         if ids["channel_id"]:
             return ids["channel_id"]
-        # ссылка с @handle
-        if ids["handle"]:
-            return _find_channel_by_search(ids["handle"])
 
-        # если ничего из этого не сработало — пробуем просто поиск по всей строке
+        if ids["handle"]:
+            # здесь уже надёжно берём через forHandle
+            return _get_channel_id_from_handle(ids["handle"])
+
+        # если не смогли ничего распарсить — пробуем общий поиск
         return _find_channel_by_search(channel)
 
-    # 5. Прочий текст: имя канала, кусок URL и т.п.
+    # Просто текст: имя канала / кусок URL
     return _find_channel_by_search(channel)
 
+
+# ---- основная функция получения видео ----
 
 def fetch_channel_videos(
     max_results: int = 5,
@@ -212,24 +238,18 @@ def fetch_channel_videos(
 ) -> List[Dict]:
     """
     Получаем список последних видео канала + статистику по ним.
-
-    channel:
-        - None             -> берём канал из YOUTUBE_CHANNEL_ID
-        - "UC..."          -> используем как есть (channelId)
-        - "@handle"        -> ищем через search
-        - URL (канал/видео)-> парсим и находим channelId
-        - обычная строка   -> ищем канал через search
+    Возвращаем список словарей с полями:
+      platform, external_id, url, title, views, likes, comments_count
     """
     _require_api_key()
 
     channel_id = _resolve_channel_id(channel)
 
-    # пробуем взять из кэша
     cached = _cache_get(channel_id, max_results)
     if cached is not None:
         return cached
 
-    # 1. Получаем ID последних видео канала
+    # 1. Получаем ID последних видео
     search_params = {
         "part": "id",
         "channelId": channel_id,
@@ -247,7 +267,7 @@ def fetch_channel_videos(
     video_ids = [item["id"]["videoId"] for item in search_data.get("items", [])]
 
     if not video_ids:
-        # у канала нет видео или они недоступны
+        # у канала нет видео или они скрыты
         return []
 
     # 2. Получаем статистику по этим видео
@@ -272,7 +292,6 @@ def fetch_channel_videos(
         title = snippet.get("title", f"Video {vid}")
         url = f"https://www.youtube.com/watch?v={vid}"
 
-        # некоторые каналы могут скрывать лайки/комментарии -> аккуратно приводим к int
         def _to_int(x):
             try:
                 return int(x)
@@ -295,7 +314,5 @@ def fetch_channel_videos(
             }
         )
 
-    # кладём в кэш
     _cache_set(channel_id, max_results, result)
-
     return result
