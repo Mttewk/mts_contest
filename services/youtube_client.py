@@ -1,6 +1,6 @@
 # services/youtube_client.py
 import os
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from dotenv import load_dotenv
 import requests
@@ -8,7 +8,7 @@ import requests
 load_dotenv()
 
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
-YOUTUBE_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID")
+YOUTUBE_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID")  # канал по умолчанию
 
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 
@@ -17,27 +17,76 @@ class YouTubeAPIError(Exception):
     pass
 
 
-def fetch_channel_videos(max_results: int = 5) -> List[Dict]:
+def _require_api_key():
+    if not YOUTUBE_API_KEY:
+        raise YouTubeAPIError("Не задан YOUTUBE_API_KEY в .env")
+
+
+def _resolve_channel_id(channel: Optional[str]) -> str:
+    """
+    Определяем channelId:
+    - если channel=None -> берём YOUTUBE_CHANNEL_ID из .env
+    - если начинается с 'UC' и длиной ~24 символа -> считаем, что это уже channelId
+    - иначе -> делаем search по строке и берём первый найденный канал
+      (подходит для 'kuplinovplay', '@kuplinovplay', URL и пр.)
+    """
+    _require_api_key()
+
+    if channel is None or channel.strip() == "":
+        if not YOUTUBE_CHANNEL_ID:
+            raise YouTubeAPIError(
+                "Канал по умолчанию не задан: YOUTUBE_CHANNEL_ID в .env пустой."
+            )
+        return YOUTUBE_CHANNEL_ID
+
+    channel = channel.strip()
+
+    # Похоже на готовый channelId
+    if channel.startswith("UC") and len(channel) >= 20:
+        return channel
+
+    # Иначе ищем по строке
+    params = {
+        "part": "snippet",
+        "type": "channel",
+        "q": channel,
+        "maxResults": 1,
+        "key": YOUTUBE_API_KEY,
+    }
+    resp = requests.get(f"{YOUTUBE_API_BASE}/search", params=params)
+    data = resp.json()
+
+    if resp.status_code != 200:
+        raise YouTubeAPIError(f"Ошибка YouTube search (канал): {data}")
+
+    items = data.get("items", [])
+    if not items:
+        raise YouTubeAPIError(f"Канал по запросу '{channel}' не найден")
+
+    channel_id = items[0]["snippet"]["channelId"]
+    return channel_id
+
+
+def fetch_channel_videos(
+    max_results: int = 5,
+    channel: Optional[str] = None,
+) -> List[Dict]:
     """
     Получаем список последних видео канала + статистику по ним.
-    Возвращаем список словарей:
-    {
-        "platform": "YouTube",
-        "external_id": "...",
-        "url": "...",
-        "title": "...",
-        "views": int,
-        "likes": int,
-        "comments_count": int,
-    }
+
+    channel:
+        - None  -> берём канал из YOUTUBE_CHANNEL_ID
+        - "UC..." (channelId) -> используем как есть
+        - любое другое (имя, @handle, часть URL) -> пытаемся найти канал через search.
     """
-    if not YOUTUBE_API_KEY or not YOUTUBE_CHANNEL_ID:
-        raise YouTubeAPIError("Не заданы YOUTUBE_API_KEY или YOUTUBE_CHANNEL_ID в .env")
+    _require_api_key()
+
+    channel_id = _resolve_channel_id(channel)
 
     # 1. Получаем ID последних видео канала
     search_params = {
         "part": "id",
-        "channelId": YOUTUBE_CHANNEL_ID,
+        "channelId": channel_id,
         "maxResults": max_results,
         "order": "date",
         "type": "video",
@@ -47,7 +96,7 @@ def fetch_channel_videos(max_results: int = 5) -> List[Dict]:
     search_data = search_resp.json()
 
     if search_resp.status_code != 200:
-        raise YouTubeAPIError(f"Ошибка YouTube search: {search_data}")
+        raise YouTubeAPIError(f"Ошибка YouTube search (видео): {search_data}")
 
     video_ids = [item["id"]["videoId"] for item in search_data.get("items", [])]
 

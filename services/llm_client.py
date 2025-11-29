@@ -16,25 +16,18 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 class LLMClientError(Exception):
+    """
+    Оставляем на будущее, сейчас наружу не бросаем.
+    """
     pass
 
 
-def ask_llm(question: str, items: List[Dict]) -> str:
+def _build_context(items: List[Dict]) -> List[Dict]:
     """
-    Отправляет вопрос + контекст по контенту в LLM
-    и возвращает текстовый ответ.
-    items — список словарей с полями:
-      title, views, likes, comments_count, platform, url
+    Нормализуем список items и считаем вовлечённость.
     """
-    if not OPENROUTER_API_KEY:
-        raise LLMClientError("Не задан OPENROUTER_API_KEY в .env")
-
-    # Сортируем по просмотрам по убыванию, чтобы LLM видела топ сверху
-    sorted_items = sorted(items, key=lambda x: x.get("views", 0), reverse=True)
-
-    # Собираем компактный контекст + считаем вовлечённость
-    context_lines = []
-    for i, it in enumerate(sorted_items, start=1):
+    normalized: List[Dict] = []
+    for it in items:
         views = int(it.get("views", 0) or 0)
         likes = int(it.get("likes", 0) or 0)
         comments = int(it.get("comments_count", 0) or 0)
@@ -43,14 +36,99 @@ def ask_llm(question: str, items: List[Dict]) -> str:
         else:
             engagement_rate = 0.0
 
+        normalized.append(
+            {
+                "platform": it.get("platform", "YouTube"),
+                "title": it.get("title", "Без названия"),
+                "url": it.get("url", ""),
+                "views": views,
+                "likes": likes,
+                "comments_count": comments,
+                "engagement_rate": engagement_rate,
+            }
+        )
+    return normalized
+
+
+def _generate_local_answer(question: str, items: List[Dict]) -> str:
+    """
+    Локальная "мини-LLM" без OpenRouter.
+    Строит ответ по данным items:
+      - считает вовлечённость
+      - выбирает топ-3 по просмотрам или по вовлечённости
+      - делает короткий вывод
+    """
+    if not items:
+        return "Нет данных о контенте, чтобы ответить на вопрос."
+
+    normalized = _build_context(items)
+    n = len(normalized)
+
+    q_lower = question.lower()
+    sort_by_engagement = "вовлеч" in q_lower  # ловим 'вовлеченность', 'вовлечённость' и т.п.
+
+    if sort_by_engagement:
+        key_name = "engagement_rate"
+        title_line = f"Топ-3 материалов по вовлечённости (из последних {n} видео):"
+    else:
+        key_name = "views"
+        title_line = f"Топ-3 материалов по просмотрам (из последних {n} видео):"
+
+    sorted_items = sorted(normalized, key=lambda x: x.get(key_name, 0), reverse=True)
+    top3 = sorted_items[:3]
+
+    lines = [title_line, ""]
+    for i, it in enumerate(top3, start=1):
+        lines.append(
+            f"{i}. {it['title']}\n"
+            f"   Просмотры: {it['views']}, лайки: {it['likes']}, "
+            f"комментарии: {it['comments_count']}, "
+            f"вовлечённость: {it['engagement_rate']:.3f}\n"
+            f"   Ссылка: {it['url']}"
+        )
+
+    # Простейший вывод
+    avg_views = sum(it["views"] for it in normalized) / n
+    avg_eng = sum(it["engagement_rate"] for it in normalized) / n
+
+    lines.append("")
+    lines.append(
+        "Вывод: топовые материалы набирают просмотров и вовлечённость выше среднего.\n"
+        f"Средние значения по выборке — просмотры: {int(avg_views)}, "
+        f"вовлечённость: {avg_eng:.3f}. "
+        "Имеет смысл делать больше похожего контента: похожие форматы, темы и длину видео."
+    )
+
+    return "\n".join(lines)
+
+
+def ask_llm(question: str, items: List[Dict]) -> str:
+    """
+    Главная функция для /chat.
+
+    Логика:
+    1) Пытаемся обратиться к OpenRouter (если задан OPENROUTER_API_KEY).
+    2) Если не получилось (401, другая ошибка, странный ответ) —
+       просто строим ответ локально (_generate_local_answer).
+    """
+    # Если ключа нет вообще — сразу локальный ответ
+    if not OPENROUTER_API_KEY:
+        return _generate_local_answer(question, items)
+
+    normalized = _build_context(items)
+    if not normalized:
+        return "Нет данных о контенте, чтобы ответить на вопрос."
+
+    context_lines = []
+    for i, it in enumerate(normalized, start=1):
         line = (
-            f"{i}. [{it.get('platform', '?')}] {it.get('title', 'Без названия')} | "
-            f"views={views}, likes={likes}, comments={comments}, "
-            f"engagement_rate={engagement_rate:.3f}, url={it.get('url')}"
+            f"{i}. [{it['platform']}] {it['title']} | "
+            f"views={it['views']}, likes={it['likes']}, comments={it['comments_count']}, "
+            f"engagement_rate={it['engagement_rate']:.3f}, url={it['url']}"
         )
         context_lines.append(line)
 
-    context_text = "\n".join(context_lines) if context_lines else "Данных о контенте нет."
+    context_text = "\n".join(context_lines)
 
     system_prompt = (
         "Ты аналитик контента в крупной компании. "
@@ -85,14 +163,22 @@ def ask_llm(question: str, items: List[Dict]) -> str:
         ],
     }
 
-    resp = requests.post(OPENROUTER_URL, headers=headers, json=body, timeout=60)
-    if resp.status_code != 200:
-        raise LLMClientError(
-            f"Ошибка OpenRouter: {resp.status_code} {resp.text}"
-        )
-
-    data = resp.json()
+    # Пытаемся обратиться к OpenRouter
     try:
-        return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        raise LLMClientError(f"Неожиданный формат ответа от LLM: {e} | data={data}")
+        resp = requests.post(OPENROUTER_URL, headers=headers, json=body, timeout=60)
+    except Exception:
+        # Любая сетевая ошибка → локальный ответ
+        return _generate_local_answer(question, items)
+
+    # Любой не-200 статус (включая 401) → локальный ответ
+    if resp.status_code != 200:
+        return _generate_local_answer(question, items)
+
+    try:
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        if not content or not isinstance(content, str):
+            return _generate_local_answer(question, items)
+        return content
+    except Exception:
+        return _generate_local_answer(question, items)
